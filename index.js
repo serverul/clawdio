@@ -132,6 +132,7 @@ const collectors = new Map();
 const pendingByRequestId = new Map();
 const pendingQueue = [];
 const playbackQueues = new Map();
+const joinDiagnostics = new Map();
 
 const commands = [
   new SlashCommandBuilder()
@@ -638,10 +639,26 @@ async function onVoiceJoin(interaction) {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 15000);
     console.log(`Voice ready in guild ${interaction.guild.id}`);
+    joinDiagnostics.set(interaction.guild.id, {
+      ok: true,
+      at: Date.now(),
+      status: connection?.state?.status || 'ready',
+      reason: 'connected',
+    });
     setupReceiver(interaction.guild.id, connection);
   } catch (error) {
+    const statusNow = connection?.state?.status || 'unknown';
+    const reason = String(error?.message || '').includes('aborted')
+      ? 'Discord voice handshake aborted (usually UDP/firewall issue on VPS)'
+      : String(error?.message || 'voice connection failed');
+    joinDiagnostics.set(interaction.guild.id, {
+      ok: false,
+      at: Date.now(),
+      status: statusNow,
+      reason,
+    });
     cleanupGuild(interaction.guild.id);
-    await interaction.editReply({ content: `Voice connection failed: ${error.message}` });
+    await interaction.editReply({ content: `Voice connection failed: ${reason}` });
     return;
   }
 
@@ -714,7 +731,7 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   const text = (message.content || '').trim().toLowerCase();
-  if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status' && text !== '!voice testtts') return;
+  if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status' && text !== '!voice testtts' && text !== '!voice diag') return;
 
   console.log(`Text fallback command received: ${text} from ${message.author.tag}`);
 
@@ -754,11 +771,27 @@ client.on('messageCreate', async (message) => {
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 15000);
         console.log(`Voice ready in guild ${message.guild.id} (fallback command)`);
+        joinDiagnostics.set(message.guild.id, {
+          ok: true,
+          at: Date.now(),
+          status: connection?.state?.status || 'ready',
+          reason: 'connected',
+        });
         setupReceiver(message.guild.id, connection);
       } catch (error) {
-        console.error(`[voice] join failed guild=${message.guild.id} status=${connection?.state?.status || 'unknown'} err=${error.message}`);
+        const statusNow = connection?.state?.status || 'unknown';
+        const reason = String(error?.message || '').includes('aborted')
+          ? 'Discord voice handshake aborted (usually UDP/firewall issue on VPS)'
+          : String(error?.message || 'voice connection failed');
+        console.error(`[voice] join failed guild=${message.guild.id} status=${statusNow} err=${error.message}`);
+        joinDiagnostics.set(message.guild.id, {
+          ok: false,
+          at: Date.now(),
+          status: statusNow,
+          reason,
+        });
         cleanupGuild(message.guild.id);
-        await message.reply(`Voice connection failed: ${error.message}`);
+        await message.reply(`Voice connection failed: ${reason}`);
         return;
       }
       connection.on(VoiceConnectionStatus.Disconnected, () => {
@@ -782,6 +815,18 @@ client.on('messageCreate', async (message) => {
     if (text === '!voice status') {
       const status = voiceConnections.has(message.guild.id) ? 'connected' : 'idle';
       await message.reply(`Voice: ${status}, Gateway: ${gatewayConnected ? 'connected' : 'disconnected'}, Pending: ${pendingQueue.length}`);
+      return;
+    }
+
+    if (text === '!voice diag') {
+      const d = joinDiagnostics.get(message.guild.id);
+      if (!d) {
+        await message.reply('No diagnostic data yet. Try !voice join first.');
+        return;
+      }
+      await message.reply(
+        `Diag: ok=${d.ok} status=${d.status} reason=${d.reason} at=${new Date(d.at).toISOString()}`
+      );
       return;
     }
 
