@@ -534,19 +534,19 @@ function cleanupGuild(guildId) {
 
 async function onVoiceJoin(interaction) {
   if (!interaction.guild) {
-    await interaction.reply({ content: 'Server-only command', ephemeral: true });
+    await interaction.editReply({ content: 'Server-only command' });
     return;
   }
 
   const member = await interaction.guild.members.fetch(interaction.user.id);
   const channel = member.voice?.channel;
   if (!channel) {
-    await interaction.reply({ content: 'Join a voice channel first', ephemeral: true });
+    await interaction.editReply({ content: 'Join a voice channel first' });
     return;
   }
 
   if (voiceConnections.has(interaction.guild.id)) {
-    await interaction.reply({ content: 'Already connected', ephemeral: true });
+    await interaction.editReply({ content: 'Already connected' });
     return;
   }
 
@@ -576,22 +576,22 @@ async function onVoiceJoin(interaction) {
     setupReceiver(interaction.guild.id, connection);
   });
 
-  await interaction.reply({ content: `Joined ${channel.name}`, ephemeral: false });
+  await interaction.editReply({ content: `Joined ${channel.name}` });
 }
 
 async function onVoiceLeave(interaction) {
   if (!interaction.guild) {
-    await interaction.reply({ content: 'Server-only command', ephemeral: true });
+    await interaction.editReply({ content: 'Server-only command' });
     return;
   }
 
   if (!voiceConnections.has(interaction.guild.id)) {
-    await interaction.reply({ content: 'Not connected', ephemeral: true });
+    await interaction.editReply({ content: 'Not connected' });
     return;
   }
 
   cleanupGuild(interaction.guild.id);
-  await interaction.reply({ content: 'Left voice channel', ephemeral: false });
+  await interaction.editReply({ content: 'Left voice channel' });
 }
 
 client.on('interactionCreate', async (interaction) => {
@@ -600,6 +600,11 @@ client.on('interactionCreate', async (interaction) => {
 
   try {
     const sub = interaction.options.getSubcommand();
+
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral: sub === 'status' });
+    }
+
     if (sub === 'join') {
       await onVoiceJoin(interaction);
       return;
@@ -610,15 +615,16 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (sub === 'status') {
       const status = interaction.guild && voiceConnections.has(interaction.guild.id) ? 'connected' : 'idle';
-      await interaction.reply({
+      await interaction.editReply({
         content: `Voice: ${status}, Gateway: ${gatewayConnected ? 'connected' : 'disconnected'}, Pending: ${pendingQueue.length}`,
-        ephemeral: true,
       });
     }
   } catch (error) {
     console.error(`Interaction failed: ${error.message}`);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'Command failed', ephemeral: true });
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: `Command failed: ${error.message}` }).catch(() => {});
+    } else {
+      await interaction.reply({ content: `Command failed: ${error.message}`, ephemeral: true }).catch(() => {});
     }
   }
 });
