@@ -7,16 +7,19 @@ const {
   createAudioResource,
   AudioPlayerStatus,
   VoiceConnectionStatus,
+  EndBehaviorType,
+  StreamType,
   entersState,
 } = require('@discordjs/voice');
+const prism = require('prism-media');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { Readable } = require('stream');
+
 const STTEngine = require('./src/stt');
 const TTSEngine = require('./src/tts');
-
-// ── OpenClaw Config Loader ────────────────────────────────────
 
 function loadOpenClawConfig() {
   const configPaths = [
@@ -25,16 +28,16 @@ function loadOpenClawConfig() {
     process.env.OPENCLAW_CONFIG_PATH,
   ].filter(Boolean);
 
-  for (const configPath of configPaths) {
+  for (const filePath of configPaths) {
     try {
-      if (fs.existsSync(configPath)) {
-        const content = fs.readFileSync(configPath, 'utf8');
-        const config = JSON.parse(content);
-        console.log(`Loaded OpenClaw config from: ${configPath}`);
-        return config;
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        console.log(`Loaded OpenClaw config from: ${filePath}`);
+        return parsed;
       }
     } catch (error) {
-      console.warn(`Failed to load config from ${configPath}:`, error.message);
+      console.warn(`Failed to read ${filePath}: ${error.message}`);
     }
   }
 
@@ -42,92 +45,67 @@ function loadOpenClawConfig() {
   return {};
 }
 
-// ── Configuration ──────────────────────────────────────────────
-
 const openclawConfig = loadOpenClawConfig();
 
-// Determine STT backend: prioritize env, then config, then default based on API key availability
-let sttBackend = process.env.STT_BACKEND;
-if (!sttBackend && openclawConfig.sttBackend) {
-  sttBackend = openclawConfig.sttBackend;
-}
+let sttBackend = process.env.STT_BACKEND || openclawConfig?.sttBackend;
 if (!sttBackend) {
-  // Default to openai if we have API key, else local
-  const hasOpenAIKey = process.env.OPENAI_API_KEY || openclawConfig?.models?.openai?.apiKey;
-  sttBackend = hasOpenAIKey ? 'openai' : 'local';
+  sttBackend = process.env.OPENAI_API_KEY || openclawConfig?.models?.openai?.apiKey ? 'openai' : 'local';
 }
+
+const gatewayPort = openclawConfig?.gateway?.port || 18789;
+const gatewayBind = openclawConfig?.gateway?.bind || 'localhost';
+const bindHost = gatewayBind === 'loopback' ? 'localhost' : gatewayBind;
 
 const CONFIG = {
-  // Discord - from env or OpenClaw config
   discordToken: process.env.DISCORD_BOT_TOKEN || openclawConfig?.channels?.discord?.token || '',
-
-  // Gateway - from env or OpenClaw config
-  openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL
-    || (openclawConfig?.gateway?.bind?.replace('loopback', 'localhost') || 'ws://localhost:18789')
-      .replace('http://', 'ws://')
-      .replace('https://', 'wss://')
-      + (openclawConfig?.gateway?.port ? `:${openclawConfig.gateway.port}` : ':18789'),
-
-  openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN
-    || process.env.OPENCLAW_GATEWAY_TOKEN
-    || openclawConfig?.gateway?.auth?.token
-    || openclawConfig?.gateway?.token
-    || '',
-
-  // STT
-  sttBackend: sttBackend,
+  discordGuildId: process.env.DISCORD_GUILD_ID || '',
+  openclawGatewayUrl:
+    process.env.OPENCLAW_GATEWAY_URL || `ws://${bindHost}:${gatewayPort}`,
+  openclawGatewayToken:
+    process.env.OPENCLAW_GATEWAY_TOKEN ||
+    openclawConfig?.gateway?.auth?.token ||
+    openclawConfig?.gateway?.token ||
+    '',
+  sessionKey: process.env.OPENCLAW_SESSION_KEY || 'main',
+  sttBackend,
   openaiApiKey: process.env.OPENAI_API_KEY || openclawConfig?.models?.openai?.apiKey || '',
-
-  // TTS
   ttsBackend: process.env.TTS_BACKEND || openclawConfig?.messages?.tts?.backend || 'edge',
-  elevenLabsApiKey: process.env.ELEVENLABS_API_KEY || openclawConfig?.messages?.tts?.elevenlabs?.apiKey || '',
-  elevenLabsVoiceId: process.env.ELEVENLABS_VOICE_ID || openclawConfig?.messages?.tts?.elevenlabs?.voiceId || '',
-
-  // Language
-  language: process.env.LANGUAGE || openclawConfig?.language || 'ro',
+  elevenLabsApiKey:
+    process.env.ELEVENLABS_API_KEY || openclawConfig?.messages?.tts?.elevenlabs?.apiKey || '',
+  elevenLabsVoiceId:
+    process.env.ELEVENLABS_VOICE_ID || openclawConfig?.messages?.tts?.elevenlabs?.voiceId || '',
+  language: process.env.LANGUAGE || 'ro',
+  minUtteranceMs: Number(process.env.MIN_UTTERANCE_MS || 350),
+  maxUtteranceMs: Number(process.env.MAX_UTTERANCE_MS || 12000),
 };
 
-// Validate required config
 function validateConfig() {
   const missing = [];
-
-  if (!CONFIG.discordToken) {
-    missing.push('DISCORD_BOT_TOKEN (or channels.discord.token in OpenClaw config)');
-  }
-  // Only require OpenAI API key if we're actually using the openai backend
-  if (!CONFIG.openaiApiKey && CONFIG.sttBackend === 'openai') {
-    missing.push('OPENAI_API_KEY (or models.openai.apiKey in OpenClaw config)');
+  if (!CONFIG.discordToken) missing.push('DISCORD_BOT_TOKEN or channels.discord.token');
+  if (CONFIG.sttBackend === 'openai' && !CONFIG.openaiApiKey) {
+    missing.push('OPENAI_API_KEY or models.openai.apiKey');
   }
 
   if (missing.length > 0) {
-    console.error('\n❌ Missing required configuration:');
-    missing.forEach(m => console.error(`   - ${m}`));
-    console.error('\nYou can either:');
-    console.error('   1. Set environment variables in .env');
-    console.error('   2. Ensure ~/.openclaw/openclaw.json has the required fields');
-    console.error('\nConfig search order:');
-    console.error('   - Environment variables (highest priority)');
-    console.error('   - ~/.openclaw/openclaw.json');
-    console.error('');
+    console.error('\nMissing configuration:');
+    for (const entry of missing) console.error(`- ${entry}`);
     process.exit(1);
   }
 
-  console.log('\n✅ Configuration loaded:');
-  console.log(`   STT Backend: ${CONFIG.sttBackend} ${CONFIG.sttBackend === 'openai' && !CONFIG.openaiApiKey ? '(will fail without API key)' : ''}`);
-  console.log(`   TTS Backend: ${CONFIG.ttsBackend}`);
-  console.log(`   Gateway: ${CONFIG.openclawGatewayUrl}`);
-  console.log(`   Language: ${CONFIG.language}`);
+  console.log('\nConfiguration:');
+  console.log(`- STT: ${CONFIG.sttBackend}`);
+  console.log(`- TTS: ${CONFIG.ttsBackend}`);
+  console.log(`- Gateway: ${CONFIG.openclawGatewayUrl}`);
+  console.log(`- Session: ${CONFIG.sessionKey}`);
+  if (CONFIG.discordGuildId) {
+    console.log(`- Slash scope: guild ${CONFIG.discordGuildId}`);
+  } else {
+    console.log('- Slash scope: global');
+  }
 }
 
-// ── State ──────────────────────────────────────────────────────
-
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
 const sttEngine = new STTEngine(CONFIG);
@@ -135,494 +113,507 @@ const ttsEngine = new TTSEngine(CONFIG);
 
 let gatewayWs = null;
 let gatewayConnected = false;
-let pendingChallenge = null;
-const voiceConnections = new Map(); // guildId -> connection
-const audioPlayers = new Map(); // guildId -> player
-const isRecording = new Map(); // guildId -> boolean
-const pendingRequests = new Map(); // idempotencyKey -> guildId (for tracking chat.send requests)
-const lastProcessed = new Map(); // guildId -> timestamp (for rate limiting)
+let gatewayChallengeNonce = null;
 
-// ── Slash Commands ─────────────────────────────────────────────
+const voiceConnections = new Map();
+const audioPlayers = new Map();
+const collectors = new Map();
+const pendingByRequestId = new Map();
+const pendingQueue = [];
+const playbackQueues = new Map();
 
 const commands = [
   new SlashCommandBuilder()
     .setName('voice')
     .setDescription('Voice commands for OpenClaw')
-    .addSubcommand(sub =>
-      sub.setName('join').setDescription('Join your voice channel and start voice conversation')
-    )
-    .addSubcommand(sub =>
-      sub.setName('leave').setDescription('Leave voice channel and stop voice conversation')
-    )
-    .addSubcommand(sub =>
-      sub.setName('status').setDescription('Check voice status')
-    ),
+    .addSubcommand((sub) => sub.setName('join').setDescription('Join your current voice channel'))
+    .addSubcommand((sub) => sub.setName('leave').setDescription('Leave voice channel'))
+    .addSubcommand((sub) => sub.setName('status').setDescription('Show voice status')),
 ];
 
 async function registerCommands() {
-  // Ensure we have a token
-  if (!CONFIG.discordToken) {
-    console.error('Cannot register commands: missing Discord token');
-    return;
-  }
   const rest = new REST({ version: '10' }).setToken(CONFIG.discordToken);
-  try {
-    console.log('Registering slash commands...');
-    await rest.put(Routes.applicationCommands(client.user.id), {
-      body: commands.map(cmd => cmd.toJSON()),
-    });
-    console.log('Slash commands registered.');
-  } catch (error) {
-    console.error('Error registering commands:', error);
+  const body = commands.map((c) => c.toJSON());
+
+  if (CONFIG.discordGuildId) {
+    await rest.put(Routes.applicationGuildCommands(client.user.id, CONFIG.discordGuildId), { body });
+    console.log(`Slash commands registered in guild ${CONFIG.discordGuildId}`);
+  } else {
+    await rest.put(Routes.applicationCommands(client.user.id), { body });
+    console.log('Global slash commands registered');
   }
 }
 
-// ── OpenClaw Gateway ───────────────────────────────────────────
+function connectGateway() {
+  if (gatewayWs && gatewayWs.readyState === WebSocket.OPEN) return;
 
-function connectToGateway() {
-  if (gatewayWs && gatewayWs.readyState === WebSocket.OPEN) {
-    console.log('Already connected to OpenClaw Gateway');
-    return;
-  }
-
-  const wsUrl = CONFIG.openclawGatewayUrl;
-  console.log(`Connecting to OpenClaw Gateway at ${wsUrl}...`);
-
-  gatewayWs = new WebSocket(wsUrl);
+  gatewayWs = new WebSocket(CONFIG.openclawGatewayUrl);
 
   gatewayWs.on('open', () => {
-    console.log('WebSocket connected, waiting for challenge...');
+    console.log('Gateway socket open, waiting for challenge');
   });
 
-  gatewayWs.on('message', (rawData) => {
+  gatewayWs.on('message', (raw) => {
+    let msg;
     try {
-      const data = rawData.toString();
-      const message = JSON.parse(data);
-      handleGatewayMessage(message);
-    } catch (error) {
-      console.error('Error parsing gateway message:', error.message);
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
     }
+    void handleGatewayMessage(msg);
   });
 
-  gatewayWs.on('close', (code) => {
-    console.log(`Disconnected from OpenClaw Gateway (code: ${code})`);
+  gatewayWs.on('close', () => {
     gatewayConnected = false;
-    pendingChallenge = null;
-    setTimeout(connectToGateway, 5000);
+    gatewayChallengeNonce = null;
+    console.log('Gateway disconnected, retrying in 5s');
+    setTimeout(connectGateway, 5000);
   });
 
-  gatewayWs.on('error', (error) => {
-    console.error('Gateway WebSocket error:', error.message);
+  gatewayWs.on('error', (err) => {
+    console.error(`Gateway error: ${err.message}`);
   });
 }
 
-function handleGatewayMessage(message) {
-  if (message.type === 'event' && message.event === 'connect.challenge') {
-    pendingChallenge = message.payload.nonce;
-    console.log('Received challenge, sending connect request...');
-    sendConnectRequest();
-    return;
-  }
-
-  if (message.type === 'res' && message.id?.startsWith('connect-')) {
-    if (message.ok) {
-      console.log('✅ Successfully connected to OpenClaw Gateway');
-      gatewayConnected = true;
-    } else {
-      console.error('❌ Failed to connect to OpenClaw Gateway:', message.error);
-      gatewayConnected = false;
-    }
-    return;
-  }
-
-  if (message.type === 'event') {
-    console.log(`Gateway event: ${message.event}`);
-
-    if (message.event === 'agent' && message.payload) {
-      handleAgentResponse(message.payload);
-    } else if (message.event === 'chat.response' && message.payload) {
-      // Handle response from OpenClaw agent
-      const payload = message.payload;
-      if (payload && payload.text) {
-        console.log(`Received response from OpenClaw: "${payload.text}"`);
-        // Look up which guild this response is for
-        const idempotencyKey = payload.idempotencyKey;
-        if (idempotencyKey && pendingRequests.has(idempotencyKey)) {
-          const guildId = pendingRequests.get(idempotencyKey);
-          pendingRequests.delete(idempotencyKey); // Clean up
-          
-          // Play TTS in the guild's voice connection
-          const connection = voiceConnections.get(guildId);
-          if (connection) {
-            const ttsResult = await ttsEngine.synthesize(payload.text, CONFIG.language);
-            if (ttsResult.audio && ttsResult.audio.length > 0) {
-              await playAudioInConnection(connection, ttsResult.audio, ttsResult.format);
-            }
-          }
-        }
-      } else {
-        console.warn('Received chat.response with missing text or idempotencyKey');
-      }
-    }
-  }
-}
-
-function sendConnectRequest() {
+function sendGatewayFrame(frame) {
   if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN) return;
+  gatewayWs.send(JSON.stringify(frame));
+}
 
-  const connectRequest = {
+function sendGatewayConnect() {
+  sendGatewayFrame({
     type: 'req',
     id: `connect-${Date.now()}`,
     method: 'connect',
     params: {
       minProtocol: 3,
       maxProtocol: 3,
-      client: {
-        id: 'clawdio',
-        version: '1.0.0',
-        platform: 'node',
-        mode: 'operator',
-      },
+      client: { id: 'clawdio', version: '1.1.0', platform: 'node', mode: 'operator' },
       role: 'operator',
       scopes: ['operator.read', 'operator.write'],
       auth: { token: CONFIG.openclawGatewayToken },
       device: {
         id: 'clawdio-device',
-        nonce: pendingChallenge || '',
+        nonce: gatewayChallengeNonce || '',
         publicKey: '',
         signature: '',
         signedAt: Date.now(),
       },
     },
-  };
-
-  gatewayWs.send(JSON.stringify(connectRequest));
+  });
 }
 
-function sendToGateway(text, guildId = null) {
-  if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN) {
-    console.error('Not connected to OpenClaw Gateway');
+function enqueuePending(guildId, requestId, idempotencyKey) {
+  const item = {
+    guildId,
+    requestId,
+    idempotencyKey,
+    sentAt: Date.now(),
+  };
+  pendingByRequestId.set(requestId, item);
+  pendingQueue.push(item);
+}
+
+function popPendingForResponse(responseRequestId) {
+  const now = Date.now();
+
+  if (responseRequestId && pendingByRequestId.has(responseRequestId)) {
+    const exact = pendingByRequestId.get(responseRequestId);
+    pendingByRequestId.delete(responseRequestId);
+    const idx = pendingQueue.findIndex((x) => x.requestId === responseRequestId);
+    if (idx >= 0) pendingQueue.splice(idx, 1);
+    return exact;
+  }
+
+  while (pendingQueue.length > 0) {
+    const first = pendingQueue.shift();
+    pendingByRequestId.delete(first.requestId);
+    if (now - first.sentAt <= 120000) {
+      return first;
+    }
+  }
+
+  return null;
+}
+
+function extractTextFromPayload(payload) {
+  if (!payload) return '';
+  if (typeof payload === 'string') return payload;
+  if (typeof payload.text === 'string') return payload.text;
+  if (typeof payload.message === 'string') return payload.message;
+  if (typeof payload.content === 'string') return payload.content;
+
+  if (Array.isArray(payload.content)) {
+    const textParts = payload.content
+      .map((block) => {
+        if (typeof block === 'string') return block;
+        if (block && typeof block.text === 'string') return block.text;
+        if (block && typeof block.content === 'string') return block.content;
+        return '';
+      })
+      .filter(Boolean);
+    return textParts.join('\n').trim();
+  }
+
+  return '';
+}
+
+async function handleGatewayMessage(msg) {
+  if (msg.type === 'event' && msg.event === 'connect.challenge') {
+    gatewayChallengeNonce = msg.payload?.nonce || '';
+    sendGatewayConnect();
     return;
   }
 
-  if (!gatewayConnected) {
-    console.error('Gateway not authenticated yet');
+  if (msg.type === 'res' && String(msg.id || '').startsWith('connect-')) {
+    gatewayConnected = !!msg.ok;
+    console.log(gatewayConnected ? 'Gateway authenticated' : 'Gateway auth failed');
     return;
   }
 
+  if (!gatewayConnected) return;
+
+  let responseText = '';
+  let responseRequestId = null;
+
+  if (msg.type === 'res' && String(msg.id || '').startsWith('send-')) {
+    responseRequestId = msg.id;
+    responseText = extractTextFromPayload(msg.payload);
+  }
+
+  if (msg.type === 'event' && (msg.event === 'chat.response' || msg.event === 'agent')) {
+    responseText = extractTextFromPayload(msg.payload);
+    responseRequestId = msg.payload?.requestId || msg.payload?.replyTo || null;
+  }
+
+  if (!responseText) return;
+
+  const pending = popPendingForResponse(responseRequestId);
+  if (!pending) {
+    return;
+  }
+
+  await speakInGuild(pending.guildId, responseText);
+}
+
+function downmixStereoToMono16le(stereoBuffer) {
+  const sampleCount = Math.floor(stereoBuffer.length / 4);
+  const mono = Buffer.alloc(sampleCount * 2);
+
+  for (let i = 0; i < sampleCount; i += 1) {
+    const left = stereoBuffer.readInt16LE(i * 4);
+    const right = stereoBuffer.readInt16LE(i * 4 + 2);
+    const mixed = Math.max(-32768, Math.min(32767, Math.trunc((left + right) / 2)));
+    mono.writeInt16LE(mixed, i * 2);
+  }
+
+  return mono;
+}
+
+function collectorKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function setupReceiver(guildId, connection) {
+  const receiver = connection.receiver;
+  if (!receiver) return;
+
+  receiver.speaking.on('start', (userId) => {
+    const key = collectorKey(guildId, userId);
+    if (collectors.has(key)) return;
+
+    const opusStream = receiver.subscribe(userId, {
+      end: {
+        behavior: EndBehaviorType.AfterSilence,
+        duration: 700,
+      },
+    });
+
+    const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
+    const state = {
+      guildId,
+      userId,
+      chunks: [],
+      startedAt: Date.now(),
+      bytes: 0,
+    };
+    collectors.set(key, state);
+
+    opusStream.on('error', () => {
+      collectors.delete(key);
+    });
+
+    decoder.on('data', (pcmStereo) => {
+      const mono = downmixStereoToMono16le(pcmStereo);
+      state.chunks.push(mono);
+      state.bytes += mono.length;
+      const elapsed = Date.now() - state.startedAt;
+      if (elapsed > CONFIG.maxUtteranceMs) {
+        opusStream.destroy();
+      }
+    });
+
+    decoder.on('error', () => {
+      collectors.delete(key);
+    });
+
+    decoder.on('end', async () => {
+      collectors.delete(key);
+      const elapsed = Date.now() - state.startedAt;
+      if (elapsed < CONFIG.minUtteranceMs) return;
+      if (state.bytes < 16000) return;
+
+      const pcmMono = Buffer.concat(state.chunks);
+      await processUtterance(guildId, pcmMono);
+    });
+
+    opusStream.pipe(decoder);
+  });
+}
+
+async function processUtterance(guildId, pcmMonoBuffer) {
+  try {
+    const text = (await sttEngine.transcribe(pcmMonoBuffer, CONFIG.language)).trim();
+    if (!text) return;
+
+    console.log(`Heard (${guildId}): ${text}`);
+    sendTextToGateway(guildId, text);
+  } catch (error) {
+    console.error(`STT failed: ${error.message}`);
+  }
+}
+
+function sendTextToGateway(guildId, text) {
+  if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayConnected) {
+    console.warn('Gateway unavailable, dropping utterance');
+    return;
+  }
+
+  const requestId = `send-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const idempotencyKey = `voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const request = {
+
+  enqueuePending(guildId, requestId, idempotencyKey);
+
+  sendGatewayFrame({
     type: 'req',
-    id: `msg-${Date.now()}`,
+    id: requestId,
     method: 'chat.send',
     params: {
-      sessionKey: 'main',
+      sessionKey: CONFIG.sessionKey,
       message: text,
-      idempotencyKey: idempotencyKey,
+      idempotencyKey,
     },
-  };
-
-  // Track this request if we have a guildId (for voice interactions)
-  if (guildId !== null) {
-    pendingRequests.set(idempotencyKey, guildId);
-  }
-
-  gatewayWs.send(JSON.stringify(request));
+  });
 }
 
-async function handleAgentResponse(payload) {
-  let text = '';
-  if (typeof payload === 'string') {
-    text = payload;
-  } else if (payload?.message) {
-    text = payload.message;
-  } else if (payload?.text) {
-    text = payload.text;
-  } else if (payload?.content) {
-    text = payload.content;
-  }
-
-  if (!text || text.trim() === '') return;
-
-  console.log(`Agent: "${text.slice(0, 80)}${text.length > 80 ? '...' : ''}"`);
-
-  // Note: We don't have guild information here, so we can't play audio
-  // This is for agent events that don't contain direct responses to our messages
-  // In practice, we might not need to handle agent events for audio playback
+async function enqueuePlayback(guildId, task) {
+  const prev = playbackQueues.get(guildId) || Promise.resolve();
+  const next = prev
+    .catch(() => undefined)
+    .then(task)
+    .catch((err) => {
+      console.error(`Playback error (${guildId}): ${err.message}`);
+    });
+  playbackQueues.set(guildId, next);
+  await next;
 }
 
-// ── Voice Connection ───────────────────────────────────────────
+async function speakInGuild(guildId, text) {
+  const connection = voiceConnections.get(guildId);
+  if (!connection) return;
 
-async function handleJoinVoiceChannel(interaction) {
+  await enqueuePlayback(guildId, async () => {
+    const tts = await ttsEngine.synthesize(text, CONFIG.language);
+    if (!tts.audio || tts.audio.length === 0) return;
+
+    const player =
+      audioPlayers.get(guildId) ||
+      (() => {
+        const p = createAudioPlayer();
+        audioPlayers.set(guildId, p);
+        connection.subscribe(p);
+        return p;
+      })();
+
+    const stream = Readable.from(tts.audio);
+    const resource = createAudioResource(stream, {
+      inputType: tts.format === 'webmOpus' ? StreamType.WebmOpus : StreamType.Arbitrary,
+    });
+
+    await new Promise((resolve, reject) => {
+      const onIdle = () => {
+        cleanup();
+        resolve();
+      };
+      const onErr = (err) => {
+        cleanup();
+        reject(err);
+      };
+      const cleanup = () => {
+        player.off(AudioPlayerStatus.Idle, onIdle);
+        player.off('error', onErr);
+      };
+
+      player.once(AudioPlayerStatus.Idle, onIdle);
+      player.once('error', onErr);
+      player.play(resource);
+    });
+  });
+}
+
+function cleanupGuild(guildId) {
+  const conn = voiceConnections.get(guildId);
+  if (conn) {
+    try {
+      conn.destroy();
+    } catch {
+      // ignore
+    }
+  }
+  voiceConnections.delete(guildId);
+
+  const player = audioPlayers.get(guildId);
+  if (player) {
+    try {
+      player.stop();
+    } catch {
+      // ignore
+    }
+  }
+  audioPlayers.delete(guildId);
+  playbackQueues.delete(guildId);
+
+  for (let i = pendingQueue.length - 1; i >= 0; i -= 1) {
+    if (pendingQueue[i].guildId === guildId) {
+      pendingByRequestId.delete(pendingQueue[i].requestId);
+      pendingQueue.splice(i, 1);
+    }
+  }
+}
+
+async function onVoiceJoin(interaction) {
   if (!interaction.guild) {
-    await interaction.reply({ content: 'This command only works in servers.', ephemeral: true });
+    await interaction.reply({ content: 'Server-only command', ephemeral: true });
     return;
   }
 
   const member = await interaction.guild.members.fetch(interaction.user.id);
-  const voiceChannel = member.voice?.channel;
-
-  if (!voiceChannel) {
-    await interaction.reply({ content: 'You must be in a voice channel first!', ephemeral: true });
+  const channel = member.voice?.channel;
+  if (!channel) {
+    await interaction.reply({ content: 'Join a voice channel first', ephemeral: true });
     return;
   }
 
   if (voiceConnections.has(interaction.guild.id)) {
-    await interaction.reply({ content: 'Already connected to a voice channel!', ephemeral: true });
+    await interaction.reply({ content: 'Already connected', ephemeral: true });
     return;
   }
 
-  try {
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: interaction.guild.id,
-      adapterCreator: interaction.guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: interaction.guild.id,
+    adapterCreator: interaction.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
 
-    voiceConnections.set(interaction.guild.id, connection);
-    isRecording.set(interaction.guild.id, true);
+  voiceConnections.set(interaction.guild.id, connection);
 
-    connection.on(VoiceConnectionStatus.Ready, () => {
-      console.log(`Connected to voice channel: ${voiceChannel.name}`);
-      setupAudioReceiver(interaction.guild.id, connection);
-    });
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+      ]);
+    } catch {
+      cleanupGuild(interaction.guild.id);
+    }
+  });
 
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-      } catch {
-        cleanupGuild(interaction.guild.id);
-      }
-    });
+  connection.on(VoiceConnectionStatus.Ready, () => {
+    console.log(`Voice ready in guild ${interaction.guild.id}`);
+    setupReceiver(interaction.guild.id, connection);
+  });
 
-    await interaction.reply({ content: `Joined **${voiceChannel.name}** — speak and I'll listen!`, ephemeral: false });
-  } catch (error) {
-    console.error('Error joining voice channel:', error.message);
-    await interaction.reply({ content: `Failed to join: ${error.message}`, ephemeral: true });
-  }
+  await interaction.reply({ content: `Joined ${channel.name}`, ephemeral: false });
 }
 
-async function handleLeaveVoiceChannel(interaction) {
+async function onVoiceLeave(interaction) {
   if (!interaction.guild) {
-    await interaction.reply({ content: 'This command only works in servers.', ephemeral: true });
+    await interaction.reply({ content: 'Server-only command', ephemeral: true });
     return;
   }
 
-  const connection = voiceConnections.get(interaction.guild.id);
-  if (!connection) {
-    await interaction.reply({ content: 'Not connected to a voice channel!', ephemeral: true });
+  if (!voiceConnections.has(interaction.guild.id)) {
+    await interaction.reply({ content: 'Not connected', ephemeral: true });
     return;
   }
 
-  connection.destroy();
   cleanupGuild(interaction.guild.id);
-  await interaction.reply({ content: '👋 Left the voice channel.', ephemeral: false });
+  await interaction.reply({ content: 'Left voice channel', ephemeral: false });
 }
-
-function cleanupGuild(guildId) {
-  voiceConnections.delete(guildId);
-  const player = audioPlayers.get(guildId);
-  if (player) {
-    player.stop();
-    audioPlayers.delete(guildId);
-  }
-  isRecording.delete(guildId);
-  pendingRequests.forEach((value, key) => {
-    if (value === guildId) {
-      pendingRequests.delete(key);
-    }
-  });
-  console.log(`Cleaned up guild ${guildId}`);
-}
-
-// ── Audio Processing ───────────────────────────────────────────
-
-function setupAudioReceiver(guildId, connection) {
-  const receiver = connection.receiver;
-  if (!receiver) {
-    console.error('No audio receiver available');
-    return;
-  }
-
-  console.log(`Audio receiver ready for guild ${guildId}`);
-
-  receiver.speaking.on('start', (userId) => {
-    if (!isRecording.get(guildId)) return;
-
-    console.log(`User ${userId} started speaking`);
-
-    const audioStream = receiver.subscribe(userId, {
-      end: { behavior: 1, duration: 1000 },
-    });
-
-    const chunks = [];
-    audioStream.on('data', (chunk) => {
-      chunks.push(chunk);
-    });
-
-    audioStream.on('end', async () => {
-      if (chunks.length === 0) return;
-
-      // Rate limiting: don't process audio too frequently
-      const now = Date.now();
-      const lastTime = lastProcessed.get(guildId) || 0;
-      if (now - lastTime < 1000) { // At most once per second
-        console.log(`Audio processing rate limited for guild ${guildId}`);
-        return;
-      }
-      lastProcessed.set(guildId, now);
-
-      const audioBuffer = Buffer.concat(chunks);
-      console.log(`Audio received: ${audioBuffer.length} bytes`);
-      await processAudio(guildId, audioBuffer);
-    });
-
-    audioStream.on('error', (err) => {
-      console.error(`Audio stream error:`, err.message);
-    });
-  });
-}
-
-async function processAudio(guildId, audioBuffer) {
-  try {
-    const transcription = await sttEngine.transcribe(audioBuffer, CONFIG.language);
-    console.log(`You: "${transcription}"`);
-
-    if (!transcription || transcription.trim() === '') {
-      if (CONFIG.sttBackend === 'openai') {
-        console.log('Empty transcription - check your OpenAI API key and audio input');
-        // Do not send empty transcriptions to avoid spamming
-        return;
-      } else {
-        console.log('Empty transcription - local STT is a placeholder; consider setting STT_BACKEND=openai with a valid API key');
-        return;
-      }
-    }
-
-    // Step 2: Send to OpenClaw Gateway
-    sendToGateway(transcription, guildId);
-  } catch (error) {
-    console.error('Error processing audio:', error.message);
-    // Do not fallback to simulated transcription - just log the error
-    if (CONFIG.sttBackend === 'openai') {
-      console.log('STT error occurred - check your OpenAI API key and connection');
-    }
-  }
-}
-
-async function playAudioInConnection(connection, audioBuffer, format = 'mp3') {
-  const { createAudioPlayer } = require('@discordjs/voice');
-
-  if (!audioBuffer || audioBuffer.length === 0) return;
-
-  const tempDir = path.join(__dirname, 'temp');
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-  }
-
-  const tempFile = path.join(tempDir, `tts_${Date.now()}.mp3`);
-  fs.writeFileSync(tempFile, audioBuffer);
-
-  try {
-    const resource = createAudioResource(tempFile);
-    let player = audioPlayers.get(connection.joinConfig.guildId);
-    if (!player) {
-      player = createAudioPlayer();
-      audioPlayers.set(connection.joinConfig.guildId, player);
-      connection.subscribe(player);
-    }
-
-    player.play(resource);
-
-    player.once(AudioPlayerStatus.Idle, () => {
-      try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
-    });
-  } catch (error) {
-    console.error('Error playing audio:', error.message);
-    try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
-  }
-}
-
-// ── Interaction Handler ────────────────────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'voice') return;
 
-  const subcommand = interaction.options.getSubcommand();
-
   try {
-    switch (subcommand) {
-      case 'join':
-        await handleJoinVoiceChannel(interaction);
-        break;
-      case 'leave':
-        await handleLeaveVoiceChannel(interaction);
-        break;
-      case 'status':
-        if (!interaction.guild) {
-          await interaction.reply({ content: 'This command only works in servers.', ephemeral: true });
-          return;
-        }
-        await interaction.reply({
-          content: voiceConnections.has(interaction.guild.id)
-            ? '✅ Connected to voice channel.'
-            : '❌ Not connected to any voice channel.',
-          ephemeral: true,
-        });
-        break;
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'join') {
+      await onVoiceJoin(interaction);
+      return;
+    }
+    if (sub === 'leave') {
+      await onVoiceLeave(interaction);
+      return;
+    }
+    if (sub === 'status') {
+      const status = interaction.guild && voiceConnections.has(interaction.guild.id) ? 'connected' : 'idle';
+      await interaction.reply({
+        content: `Voice: ${status}, Gateway: ${gatewayConnected ? 'connected' : 'disconnected'}, Pending: ${pendingQueue.length}`,
+        ephemeral: true,
+      });
     }
   } catch (error) {
-    console.error('Interaction error:', error.message);
+    console.error(`Interaction failed: ${error.message}`);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'Command failed', ephemeral: true });
+    }
   }
 });
 
-// ── Startup & Shutdown ────────────────────────────────────────
-
 client.once('ready', async () => {
-  console.log(`\n🤖 Logged in as ${client.user.tag}`);
+  console.log(`Logged in as ${client.user.tag}`);
   await registerCommands();
-  connectToGateway();
-});
-
-validateConfig();
-client.login(CONFIG.discordToken).catch((error) => {
-  console.error('Failed to login to Discord:', error.message);
-  process.exit(1);
+  connectGateway();
 });
 
 function shutdown() {
-  console.log('\nShutting down...');
-  for (const [, connection] of voiceConnections) {
-    connection.destroy();
+  console.log('Shutting down');
+  for (const guildId of Array.from(voiceConnections.keys())) {
+    cleanupGuild(guildId);
   }
-  voiceConnections.clear();
-  audioPlayers.clear();
-  isRecording.clear();
-  pendingRequests.clear();
-  lastProcessed.clear();
+  collectors.clear();
+  pendingByRequestId.clear();
+  pendingQueue.length = 0;
 
-  if (gatewayWs) gatewayWs.close();
-  client.destroy();
-
-  // Clean temp directory
-  const tempDir = path.join(__dirname, 'temp');
-  try {
-    if (fs.existsSync(tempDir)) {
-      const files = fs.readdirSync(tempDir);
-      for (const file of files) {
-        fs.unlinkSync(path.join(tempDir, file));
-      }
+  if (gatewayWs) {
+    try {
+      gatewayWs.close();
+    } catch {
+      // ignore
     }
-  } catch {}
+  }
 
+  client.destroy();
   process.exit(0);
 }
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+validateConfig();
+client.login(CONFIG.discordToken).catch((error) => {
+  console.error(`Discord login failed: ${error.message}`);
+  process.exit(1);
+});

@@ -49,6 +49,7 @@ Create `.env` to override any setting:
 ```env
 # Only needed if not in OpenClaw config or to override
 DISCORD_BOT_TOKEN=your_discord_bot_token
+DISCORD_GUILD_ID=123456789012345678
 OPENCLAW_GATEWAY_URL=ws://localhost:18789
 OPENCLAW_GATEWAY_TOKEN=your_gateway_token_if_needed
 STT_BACKEND=openai
@@ -57,6 +58,8 @@ TTS_BACKEND=edge
 ELEVENLABS_API_KEY=
 LANGUAGE=ro
 ```
+
+`DISCORD_GUILD_ID` is recommended for instant slash-command updates in one server.
 
 ### 4. Use in Discord
 1. Invite your bot to the server (needs `Connect` + `Speak` perms in voice channels)

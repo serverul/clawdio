@@ -46,7 +46,7 @@ class TTSEngine {
 
     try {
       const tts = new MsEdgeTTS();
-      await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+      await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
 
       const audioStream = tts.toStream(text);
       const chunks = [];
@@ -60,7 +60,7 @@ class TTSEngine {
       const audioBuffer = Buffer.concat(chunks);
       return {
         audio: audioBuffer,
-        format: 'mp3',
+        format: 'webmOpus',
         voice: voice,
       };
     } catch (error) {
