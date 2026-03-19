@@ -109,7 +109,12 @@ function validateConfig() {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 const sttEngine = new STTEngine(CONFIG);
@@ -538,9 +543,20 @@ async function onVoiceJoin(interaction) {
     return;
   }
 
-  const member = await interaction.guild.members.fetch(interaction.user.id);
-  const channel = member.voice?.channel;
-  if (!channel) {
+  const interactionMember = interaction.member;
+  const channel = interactionMember?.voice?.channel || null;
+  console.log(`Join requested by ${interaction.user?.tag || interaction.user?.id} in guild ${interaction.guild.id}`);
+
+  let voiceChannel = channel;
+  if (!voiceChannel) {
+    try {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      voiceChannel = member.voice?.channel || null;
+    } catch (error) {
+      console.error(`Failed to fetch member voice state: ${error.message}`);
+    }
+  }
+  if (!voiceChannel) {
     await interaction.editReply({ content: 'Join a voice channel first' });
     return;
   }
@@ -551,7 +567,7 @@ async function onVoiceJoin(interaction) {
   }
 
   const connection = joinVoiceChannel({
-    channelId: channel.id,
+    channelId: voiceChannel.id,
     guildId: interaction.guild.id,
     adapterCreator: interaction.guild.voiceAdapterCreator,
     selfDeaf: false,
@@ -576,7 +592,7 @@ async function onVoiceJoin(interaction) {
     setupReceiver(interaction.guild.id, connection);
   });
 
-  await interaction.editReply({ content: `Joined ${channel.name}` });
+  await interaction.editReply({ content: `Joined ${voiceChannel.name}` });
 }
 
 async function onVoiceLeave(interaction) {
@@ -600,6 +616,7 @@ client.on('interactionCreate', async (interaction) => {
 
   try {
     const sub = interaction.options.getSubcommand();
+    console.log(`Slash command received: /voice ${sub} from ${interaction.user?.tag || interaction.user?.id}`);
 
     if (!interaction.deferred && !interaction.replied) {
       try {
@@ -636,6 +653,69 @@ client.on('interactionCreate', async (interaction) => {
     } else {
       await interaction.reply({ content: `Command failed: ${error.message}`, ephemeral: true }).catch(() => {});
     }
+  }
+});
+
+client.on('messageCreate', async (message) => {
+  if (!message.guild) return;
+  if (message.author.bot) return;
+
+  const text = (message.content || '').trim().toLowerCase();
+  if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status') return;
+
+  console.log(`Text fallback command received: ${text} from ${message.author.tag}`);
+
+  try {
+    if (text === '!voice join') {
+      const member = message.member;
+      const voiceChannel = member?.voice?.channel || null;
+      if (!voiceChannel) {
+        await message.reply('Join a voice channel first.');
+        return;
+      }
+      if (voiceConnections.has(message.guild.id)) {
+        await message.reply('Already connected.');
+        return;
+      }
+
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false,
+      });
+
+      voiceConnections.set(message.guild.id, connection);
+      connection.on(VoiceConnectionStatus.Ready, () => {
+        console.log(`Voice ready in guild ${message.guild.id} (fallback command)`);
+        setupReceiver(message.guild.id, connection);
+      });
+      connection.on(VoiceConnectionStatus.Disconnected, () => {
+        cleanupGuild(message.guild.id);
+      });
+
+      await message.reply(`Joined ${voiceChannel.name}.`);
+      return;
+    }
+
+    if (text === '!voice leave') {
+      if (!voiceConnections.has(message.guild.id)) {
+        await message.reply('Not connected.');
+        return;
+      }
+      cleanupGuild(message.guild.id);
+      await message.reply('Left voice channel.');
+      return;
+    }
+
+    if (text === '!voice status') {
+      const status = voiceConnections.has(message.guild.id) ? 'connected' : 'idle';
+      await message.reply(`Voice: ${status}, Gateway: ${gatewayConnected ? 'connected' : 'disconnected'}, Pending: ${pendingQueue.length}`);
+    }
+  } catch (error) {
+    console.error(`Fallback command failed: ${error.message}`);
+    await message.reply(`Command failed: ${error.message}`).catch(() => {});
   }
 });
 
