@@ -1,0 +1,27 @@
+{
+  "name": "openclaw-voice-discord",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin for Discord voice calls with STT/TTS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["openclaw", "discord", "voice", "stt", "tts", "ai"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "@discordjs/voice": "^0.17.0",
+    "@discordjs/opus": "^0.9.0",
+    "sodium-native": "^4.1.1",
+    "ws": "^8.18.0",
+    "msedge-tts": "^2.0.4",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
