@@ -602,7 +602,15 @@ client.on('interactionCreate', async (interaction) => {
     const sub = interaction.options.getSubcommand();
 
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ ephemeral: sub === 'status' });
+      try {
+        await interaction.deferReply({
+          flags: sub === 'status' ? 64 : undefined,
+        });
+      } catch (ackError) {
+        if (!String(ackError.message || '').includes('already been acknowledged')) {
+          throw ackError;
+        }
+      }
     }
 
     if (sub === 'join') {
@@ -622,7 +630,9 @@ client.on('interactionCreate', async (interaction) => {
   } catch (error) {
     console.error(`Interaction failed: ${error.message}`);
     if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: `Command failed: ${error.message}` }).catch(() => {});
+      await interaction
+        .followUp({ content: `Command failed: ${error.message}`, flags: 64 })
+        .catch(() => {});
     } else {
       await interaction.reply({ content: `Command failed: ${error.message}`, ephemeral: true }).catch(() => {});
     }
