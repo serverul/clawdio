@@ -16,12 +16,20 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const dns = require('dns');
 const { Readable } = require('stream');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 
 const STTEngine = require('./src/stt');
 const TTSEngine = require('./src/tts');
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+  console.log('DNS result order: ipv4first');
+} catch {
+  // ignore on older runtimes
+}
 
 function loadOpenClawConfig() {
   const configPaths = [
