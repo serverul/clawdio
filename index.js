@@ -476,6 +476,13 @@ async function speakInGuild(guildId, text) {
   if (!connection) return;
 
   await enqueuePlayback(guildId, async () => {
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 5000);
+    } catch {
+      console.error(`[tts] connection not ready guild=${guildId}`);
+      return;
+    }
+
     console.log(`[tts] synth start guild=${guildId} textLen=${text.length}`);
     const tts = await ttsEngine.synthesize(text, CONFIG.language);
     if (!tts.audio || tts.audio.length === 0) return;
@@ -490,12 +497,24 @@ async function speakInGuild(guildId, text) {
         return p;
       })();
 
-    const stream = Readable.from(tts.audio);
-    const resource = createAudioResource(stream, {
+    const tempDir = path.join(__dirname, 'temp');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    const ext = tts.format === 'webmOpus' ? 'webm' : 'bin';
+    const tempFile = path.join(tempDir, `tts-play-${guildId}-${Date.now()}.${ext}`);
+    fs.writeFileSync(tempFile, tts.audio);
+
+    const resource = createAudioResource(tempFile, {
       inputType: tts.format === 'webmOpus' ? StreamType.WebmOpus : StreamType.Arbitrary,
     });
 
     await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('playback timeout'));
+      }, 15000);
+
       const onIdle = () => {
         cleanup();
         resolve();
@@ -505,6 +524,7 @@ async function speakInGuild(guildId, text) {
         reject(err);
       };
       const cleanup = () => {
+        clearTimeout(timeout);
         player.off(AudioPlayerStatus.Idle, onIdle);
         player.off('error', onErr);
       };
@@ -513,6 +533,12 @@ async function speakInGuild(guildId, text) {
       player.once('error', onErr);
       player.play(resource);
     });
+
+    try {
+      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    } catch {
+      // ignore
+    }
     console.log(`[tts] playback done guild=${guildId}`);
   });
 }
@@ -710,10 +736,15 @@ client.on('messageCreate', async (message) => {
       });
 
       voiceConnections.set(message.guild.id, connection);
-      connection.on(VoiceConnectionStatus.Ready, () => {
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 15000);
         console.log(`Voice ready in guild ${message.guild.id} (fallback command)`);
         setupReceiver(message.guild.id, connection);
-      });
+      } catch (error) {
+        cleanupGuild(message.guild.id);
+        await message.reply(`Voice connection failed: ${error.message}`);
+        return;
+      }
       connection.on(VoiceConnectionStatus.Disconnected, () => {
         cleanupGuild(message.guild.id);
       });
