@@ -46,6 +46,17 @@ function loadOpenClawConfig() {
 
 const openclawConfig = loadOpenClawConfig();
 
+// Determine STT backend: prioritize env, then config, then default based on API key availability
+let sttBackend = process.env.STT_BACKEND;
+if (!sttBackend && openclawConfig.sttBackend) {
+  sttBackend = openclawConfig.sttBackend;
+}
+if (!sttBackend) {
+  // Default to openai if we have API key, else local
+  const hasOpenAIKey = process.env.OPENAI_API_KEY || openclawConfig?.models?.openai?.apiKey;
+  sttBackend = hasOpenAIKey ? 'openai' : 'local';
+}
+
 const CONFIG = {
   // Discord - from env or OpenClaw config
   discordToken: process.env.DISCORD_BOT_TOKEN || openclawConfig?.channels?.discord?.token || '',
@@ -53,9 +64,9 @@ const CONFIG = {
   // Gateway - from env or OpenClaw config
   openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL
     || (openclawConfig?.gateway?.bind?.replace('loopback', 'localhost') || 'ws://localhost:18789')
-    .replace('http://', 'ws://')
-    .replace('https://', 'wss://')
-    + (openclawConfig?.gateway?.port ? `:${openclawConfig.gateway.port}` : ':18789'),
+      .replace('http://', 'ws://')
+      .replace('https://', 'wss://')
+      + (openclawConfig?.gateway?.port ? `:${openclawConfig.gateway.port}` : ':18789'),
 
   openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN
     || process.env.OPENCLAW_GATEWAY_TOKEN
@@ -64,16 +75,16 @@ const CONFIG = {
     || '',
 
   // STT
-  sttBackend: process.env.STT_BACKEND || 'openai',
+  sttBackend: sttBackend,
   openaiApiKey: process.env.OPENAI_API_KEY || openclawConfig?.models?.openai?.apiKey || '',
 
   // TTS
-  ttsBackend: process.env.TTS_BACKEND || 'edge',
+  ttsBackend: process.env.TTS_BACKEND || openclawConfig?.messages?.tts?.backend || 'edge',
   elevenLabsApiKey: process.env.ELEVENLABS_API_KEY || openclawConfig?.messages?.tts?.elevenlabs?.apiKey || '',
   elevenLabsVoiceId: process.env.ELEVENLABS_VOICE_ID || openclawConfig?.messages?.tts?.elevenlabs?.voiceId || '',
 
   // Language
-  language: process.env.LANGUAGE || 'ro',
+  language: process.env.LANGUAGE || openclawConfig?.language || 'ro',
 };
 
 // Validate required config
@@ -83,6 +94,7 @@ function validateConfig() {
   if (!CONFIG.discordToken) {
     missing.push('DISCORD_BOT_TOKEN (or channels.discord.token in OpenClaw config)');
   }
+  // Only require OpenAI API key if we're actually using the openai backend
   if (!CONFIG.openaiApiKey && CONFIG.sttBackend === 'openai') {
     missing.push('OPENAI_API_KEY (or models.openai.apiKey in OpenClaw config)');
   }
@@ -101,7 +113,7 @@ function validateConfig() {
   }
 
   console.log('\n✅ Configuration loaded:');
-  console.log(`   STT Backend: ${CONFIG.sttBackend}`);
+  console.log(`   STT Backend: ${CONFIG.sttBackend} ${CONFIG.sttBackend === 'openai' && !CONFIG.openaiApiKey ? '(will fail without API key)' : ''}`);
   console.log(`   TTS Backend: ${CONFIG.ttsBackend}`);
   console.log(`   Gateway: ${CONFIG.openclawGatewayUrl}`);
   console.log(`   Language: ${CONFIG.language}`);
@@ -439,7 +451,16 @@ async function processAudio(guildId, audioBuffer) {
     const transcription = await sttEngine.transcribe(audioBuffer, CONFIG.language);
     console.log(`You: "${transcription}"`);
 
-    if (!transcription || transcription.trim() === '') return;
+    if (!transcription || transcription.trim() === '') {
+      if (CONFIG.sttBackend === 'openai') {
+        console.log('Empty transcription - check your OpenAI API key and audio input');
+      } else {
+        console.log('Empty transcription - local STT is a placeholder; consider setting STT_BACKEND=openai with a valid API key');
+      }
+      return;
+    }
+
+    // Step 2: Send to OpenClaw Gateway
     sendToGateway(transcription);
   } catch (error) {
     console.error('Error processing audio:', error.message);
@@ -540,10 +561,12 @@ function shutdown() {
   if (gatewayWs) gatewayWs.close();
   client.destroy();
 
+  // Clean temp directory
   const tempDir = path.join(__dirname, 'temp');
   try {
     if (fs.existsSync(tempDir)) {
-      for (const file of fs.readdirSync(tempDir)) {
+      const files = fs.readdirSync(tempDir);
+      for (const file of files) {
         fs.unlinkSync(path.join(tempDir, file));
       }
     }
