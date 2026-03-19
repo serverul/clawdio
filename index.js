@@ -181,25 +181,30 @@ function sendGatewayFrame(frame) {
 }
 
 function sendGatewayConnect() {
+  const params = {
+    minProtocol: 3,
+    maxProtocol: 3,
+    client: { id: 'clawdio', version: '1.1.0', platform: 'node', mode: 'operator' },
+    role: 'operator',
+    scopes: ['operator.read', 'operator.write'],
+    device: {
+      id: 'clawdio-device',
+      nonce: gatewayChallengeNonce || '',
+      publicKey: '',
+      signature: '',
+      signedAt: Date.now(),
+    },
+  };
+
+  if (CONFIG.openclawGatewayToken && CONFIG.openclawGatewayToken.trim() !== '') {
+    params.auth = { token: CONFIG.openclawGatewayToken };
+  }
+
   sendGatewayFrame({
     type: 'req',
     id: `connect-${Date.now()}`,
     method: 'connect',
-    params: {
-      minProtocol: 3,
-      maxProtocol: 3,
-      client: { id: 'clawdio', version: '1.1.0', platform: 'node', mode: 'operator' },
-      role: 'operator',
-      scopes: ['operator.read', 'operator.write'],
-      auth: { token: CONFIG.openclawGatewayToken },
-      device: {
-        id: 'clawdio-device',
-        nonce: gatewayChallengeNonce || '',
-        publicKey: '',
-        signature: '',
-        signedAt: Date.now(),
-      },
-    },
+    params,
   });
 }
 
@@ -267,7 +272,16 @@ async function handleGatewayMessage(msg) {
 
   if (msg.type === 'res' && String(msg.id || '').startsWith('connect-')) {
     gatewayConnected = !!msg.ok;
-    console.log(gatewayConnected ? 'Gateway authenticated' : 'Gateway auth failed');
+    if (gatewayConnected) {
+      console.log('Gateway authenticated');
+    } else {
+      const errCode = msg?.error?.details?.code || msg?.error?.code || 'UNKNOWN';
+      const errMsg = msg?.error?.message || 'connect rejected';
+      console.error(`Gateway auth failed: ${errCode} ${errMsg}`);
+      if (!CONFIG.openclawGatewayToken) {
+        console.error('Tip: set OPENCLAW_GATEWAY_TOKEN if your gateway requires auth');
+      }
+    }
     return;
   }
 
