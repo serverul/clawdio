@@ -59,7 +59,7 @@ if (!sttBackend) {
 
 const CONFIG = {
   // Discord - from env or OpenClaw config
-  discordToken: process.env.DISCORD_BOT_TOKEN || openclawConfig?.channels?.discord?.botToken || '',
+  discordToken: process.env.DISCORD_BOT_TOKEN || openclawConfig?.channels?.discord?.token || '',
 
   // Gateway - from env or OpenClaw config
   openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL
@@ -92,7 +92,7 @@ function validateConfig() {
   const missing = [];
 
   if (!CONFIG.discordToken) {
-    missing.push('DISCORD_BOT_TOKEN (or channels.discord.botToken in OpenClaw config)');
+    missing.push('DISCORD_BOT_TOKEN (or channels.discord.token in OpenClaw config)');
   }
   // Only require OpenAI API key if we're actually using the openai backend
   if (!CONFIG.openaiApiKey && CONFIG.sttBackend === 'openai') {
