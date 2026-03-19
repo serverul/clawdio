@@ -17,6 +17,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { Readable } = require('stream');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 
 const STTEngine = require('./src/stt');
 const TTSEngine = require('./src/tts');
@@ -67,6 +69,8 @@ const CONFIG = {
     openclawConfig?.gateway?.token ||
     '',
   sessionKey: process.env.OPENCLAW_SESSION_KEY || 'main',
+  transport: process.env.OPENCLAW_TRANSPORT || 'gateway',
+  openclawCliPath: process.env.OPENCLAW_CLI_PATH || 'openclaw',
   sttBackend,
   openaiApiKey: process.env.OPENAI_API_KEY || openclawConfig?.models?.openai?.apiKey || '',
   ttsBackend: process.env.TTS_BACKEND || openclawConfig?.messages?.tts?.backend || 'edge',
@@ -110,6 +114,7 @@ const client = new Client({
 
 const sttEngine = new STTEngine(CONFIG);
 const ttsEngine = new TTSEngine(CONFIG);
+const execFileAsync = promisify(execFile);
 
 let gatewayWs = null;
 let gatewayConnected = false;
@@ -184,14 +189,14 @@ function sendGatewayConnect() {
   const params = {
     minProtocol: 3,
     maxProtocol: 3,
-    client: { id: 'clawdio', version: '1.1.0', platform: 'node', mode: 'operator' },
+    client: { id: 'cli', version: '1.1.0', platform: 'linux', mode: 'operator' },
     role: 'operator',
     scopes: ['operator.read', 'operator.write'],
     device: {
       id: 'clawdio-device',
       nonce: gatewayChallengeNonce || '',
-      publicKey: '',
-      signature: '',
+      publicKey: 'clawdio-public-key-placeholder',
+      signature: 'clawdio-signature-placeholder',
       signedAt: Date.now(),
     },
   };
@@ -281,6 +286,7 @@ async function handleGatewayMessage(msg) {
       if (!CONFIG.openclawGatewayToken) {
         console.error('Tip: set OPENCLAW_GATEWAY_TOKEN if your gateway requires auth');
       }
+      console.error('Falling back to CLI transport for voice responses');
     }
     return;
   }
@@ -391,7 +397,11 @@ async function processUtterance(guildId, pcmMonoBuffer) {
     if (!text) return;
 
     console.log(`Heard (${guildId}): ${text}`);
-    sendTextToGateway(guildId, text);
+    if (CONFIG.transport === 'cli' || !gatewayConnected) {
+      await sendTextToCli(guildId, text);
+    } else {
+      sendTextToGateway(guildId, text);
+    }
   } catch (error) {
     console.error(`STT failed: ${error.message}`);
   }
@@ -399,7 +409,8 @@ async function processUtterance(guildId, pcmMonoBuffer) {
 
 function sendTextToGateway(guildId, text) {
   if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayConnected) {
-    console.warn('Gateway unavailable, dropping utterance');
+    console.warn('Gateway unavailable, using CLI fallback');
+    void sendTextToCli(guildId, text);
     return;
   }
 
@@ -418,6 +429,22 @@ function sendTextToGateway(guildId, text) {
       idempotencyKey,
     },
   });
+}
+
+async function sendTextToCli(guildId, text) {
+  try {
+    const args = ['agent', '--message', text];
+    const { stdout } = await execFileAsync(CONFIG.openclawCliPath, args, {
+      timeout: 120000,
+      maxBuffer: 1024 * 1024,
+    });
+    const reply = String(stdout || '').trim();
+    if (!reply) return;
+    await speakInGuild(guildId, reply);
+  } catch (error) {
+    const stderr = error?.stderr ? String(error.stderr).trim() : '';
+    console.error(`CLI transport failed: ${stderr || error.message}`);
+  }
 }
 
 async function enqueuePlayback(guildId, task) {
@@ -596,10 +623,14 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   await registerCommands();
-  connectGateway();
+  if (CONFIG.transport === 'gateway') {
+    connectGateway();
+  } else {
+    console.log('Using CLI transport (gateway disabled)');
+  }
 });
 
 function shutdown() {

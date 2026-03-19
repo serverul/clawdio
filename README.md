@@ -52,6 +52,7 @@ DISCORD_BOT_TOKEN=your_discord_bot_token
 DISCORD_GUILD_ID=123456789012345678
 OPENCLAW_GATEWAY_URL=ws://localhost:18789
 OPENCLAW_GATEWAY_TOKEN=your_gateway_token_if_needed
+OPENCLAW_TRANSPORT=gateway
 STT_BACKEND=openai
 OPENAI_API_KEY=sk-...
 TTS_BACKEND=edge
@@ -60,6 +61,7 @@ LANGUAGE=ro
 ```
 
 `DISCORD_GUILD_ID` is recommended for instant slash-command updates in one server.
+If gateway client auth rejects the socket connection, set `OPENCLAW_TRANSPORT=cli` to run through the local `openclaw` CLI.
 
 ### 4. Use in Discord
 1. Invite your bot to the server (needs `Connect` + `Speak` perms in voice channels)
