@@ -136,9 +136,11 @@ const ttsEngine = new TTSEngine(CONFIG);
 let gatewayWs = null;
 let gatewayConnected = false;
 let pendingChallenge = null;
-const voiceConnections = new Map();
-const audioPlayers = new Map();
-const isRecording = new Map();
+const voiceConnections = new Map(); // guildId -> connection
+const audioPlayers = new Map(); // guildId -> player
+const isRecording = new Map(); // guildId -> boolean
+const pendingRequests = new Map(); // idempotencyKey -> guildId (for tracking chat.send requests)
+const lastProcessed = new Map(); // guildId -> timestamp (for rate limiting)
 
 // ── Slash Commands ─────────────────────────────────────────────
 
@@ -238,6 +240,29 @@ function handleGatewayMessage(message) {
 
     if (message.event === 'agent' && message.payload) {
       handleAgentResponse(message.payload);
+    } else if (message.event === 'chat.response' && message.payload) {
+      // Handle response from OpenClaw agent
+      const payload = message.payload;
+      if (payload && payload.text) {
+        console.log(`Received response from OpenClaw: "${payload.text}"`);
+        // Look up which guild this response is for
+        const idempotencyKey = payload.idempotencyKey;
+        if (idempotencyKey && pendingRequests.has(idempotencyKey)) {
+          const guildId = pendingRequests.get(idempotencyKey);
+          pendingRequests.delete(idempotencyKey); // Clean up
+          
+          // Play TTS in the guild's voice connection
+          const connection = voiceConnections.get(guildId);
+          if (connection) {
+            const ttsResult = await ttsEngine.synthesize(payload.text, CONFIG.language);
+            if (ttsResult.audio && ttsResult.audio.length > 0) {
+              await playAudioInConnection(connection, ttsResult.audio, ttsResult.format);
+            }
+          }
+        }
+      } else {
+        console.warn('Received chat.response with missing text or idempotencyKey');
+      }
     }
   }
 }
@@ -274,7 +299,7 @@ function sendConnectRequest() {
   gatewayWs.send(JSON.stringify(connectRequest));
 }
 
-function sendToGateway(text) {
+function sendToGateway(text, guildId = null) {
   if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN) {
     console.error('Not connected to OpenClaw Gateway');
     return;
@@ -285,16 +310,22 @@ function sendToGateway(text) {
     return;
   }
 
+  const idempotencyKey = `voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const request = {
     type: 'req',
-    id: `send-${Date.now()}`,
+    id: `msg-${Date.now()}`,
     method: 'chat.send',
     params: {
       sessionKey: 'main',
       message: text,
-      idempotencyKey: `voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      idempotencyKey: idempotencyKey,
     },
   };
+
+  // Track this request if we have a guildId (for voice interactions)
+  if (guildId !== null) {
+    pendingRequests.set(idempotencyKey, guildId);
+  }
 
   gatewayWs.send(JSON.stringify(request));
 }
@@ -315,16 +346,9 @@ async function handleAgentResponse(payload) {
 
   console.log(`Agent: "${text.slice(0, 80)}${text.length > 80 ? '...' : ''}"`);
 
-  for (const [guildId, connection] of voiceConnections) {
-    try {
-      const ttsResult = await ttsEngine.synthesize(text, CONFIG.language);
-      if (ttsResult.audio && ttsResult.audio.length > 0) {
-        await playAudioInConnection(connection, ttsResult.audio, ttsResult.format);
-      }
-    } catch (error) {
-      console.error(`TTS error for guild ${guildId}:`, error.message);
-    }
-  }
+  // Note: We don't have guild information here, so we can't play audio
+  // This is for agent events that don't contain direct responses to our messages
+  // In practice, we might not need to handle agent events for audio playback
 }
 
 // ── Voice Connection ───────────────────────────────────────────
@@ -376,10 +400,7 @@ async function handleJoinVoiceChannel(interaction) {
       }
     });
 
-    await interaction.reply({
-      content: `🎙️ Joined **${voiceChannel.name}** — speak and I'll listen!`,
-      ephemeral: false,
-    });
+    await interaction.reply({ content: `Joined **${voiceChannel.name}** — speak and I'll listen!`, ephemeral: false });
   } catch (error) {
     console.error('Error joining voice channel:', error.message);
     await interaction.reply({ content: `Failed to join: ${error.message}`, ephemeral: true });
@@ -411,6 +432,11 @@ function cleanupGuild(guildId) {
     audioPlayers.delete(guildId);
   }
   isRecording.delete(guildId);
+  pendingRequests.forEach((value, key) => {
+    if (value === guildId) {
+      pendingRequests.delete(key);
+    }
+  });
   console.log(`Cleaned up guild ${guildId}`);
 }
 
@@ -435,10 +461,21 @@ function setupAudioReceiver(guildId, connection) {
     });
 
     const chunks = [];
-    audioStream.on('data', (chunk) => chunks.push(chunk));
+    audioStream.on('data', (chunk) => {
+      chunks.push(chunk);
+    });
 
     audioStream.on('end', async () => {
       if (chunks.length === 0) return;
+
+      // Rate limiting: don't process audio too frequently
+      const now = Date.now();
+      const lastTime = lastProcessed.get(guildId) || 0;
+      if (now - lastTime < 1000) { // At most once per second
+        console.log(`Audio processing rate limited for guild ${guildId}`);
+        return;
+      }
+      lastProcessed.set(guildId, now);
 
       const audioBuffer = Buffer.concat(chunks);
       console.log(`Audio received: ${audioBuffer.length} bytes`);
@@ -459,16 +496,22 @@ async function processAudio(guildId, audioBuffer) {
     if (!transcription || transcription.trim() === '') {
       if (CONFIG.sttBackend === 'openai') {
         console.log('Empty transcription - check your OpenAI API key and audio input');
+        // Do not send empty transcriptions to avoid spamming
+        return;
       } else {
         console.log('Empty transcription - local STT is a placeholder; consider setting STT_BACKEND=openai with a valid API key');
+        return;
       }
-      return;
     }
 
     // Step 2: Send to OpenClaw Gateway
-    sendToGateway(transcription);
+    sendToGateway(transcription, guildId);
   } catch (error) {
     console.error('Error processing audio:', error.message);
+    // Do not fallback to simulated transcription - just log the error
+    if (CONFIG.sttBackend === 'openai') {
+      console.log('STT error occurred - check your OpenAI API key and connection');
+    }
   }
 }
 
@@ -488,7 +531,6 @@ async function playAudioInConnection(connection, audioBuffer, format = 'mp3') {
   try {
     const resource = createAudioResource(tempFile);
     let player = audioPlayers.get(connection.joinConfig.guildId);
-
     if (!player) {
       player = createAudioPlayer();
       audioPlayers.set(connection.joinConfig.guildId, player);
@@ -562,6 +604,8 @@ function shutdown() {
   voiceConnections.clear();
   audioPlayers.clear();
   isRecording.clear();
+  pendingRequests.clear();
+  lastProcessed.clear();
 
   if (gatewayWs) gatewayWs.close();
   client.destroy();
