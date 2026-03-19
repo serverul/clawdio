@@ -476,8 +476,10 @@ async function speakInGuild(guildId, text) {
   if (!connection) return;
 
   await enqueuePlayback(guildId, async () => {
+    console.log(`[tts] synth start guild=${guildId} textLen=${text.length}`);
     const tts = await ttsEngine.synthesize(text, CONFIG.language);
     if (!tts.audio || tts.audio.length === 0) return;
+    console.log(`[tts] synth ok guild=${guildId} bytes=${tts.audio.length} format=${tts.format}`);
 
     const player =
       audioPlayers.get(guildId) ||
@@ -511,6 +513,7 @@ async function speakInGuild(guildId, text) {
       player.once('error', onErr);
       player.play(resource);
     });
+    console.log(`[tts] playback done guild=${guildId}`);
   });
 }
 
@@ -681,7 +684,6 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   const text = (message.content || '').trim().toLowerCase();
-  if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status') return;
   if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status' && text !== '!voice testtts') return;
 
   console.log(`Text fallback command received: ${text} from ${message.author.tag}`);

@@ -48,16 +48,15 @@ class TTSEngine {
       const tts = new MsEdgeTTS();
       await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
 
-      const audioStream = tts.toStream(text);
-      const chunks = [];
+      const result = await tts.toFile(this.tempDir, text);
+      const audioPath = result?.audioFilePath;
+      if (!audioPath || !fs.existsSync(audioPath)) {
+        throw new Error('Edge TTS did not return an audio file');
+      }
 
-      await new Promise((resolve, reject) => {
-        audioStream.on('data', (chunk) => chunks.push(chunk));
-        audioStream.on('end', resolve);
-        audioStream.on('error', reject);
-      });
+      const audioBuffer = fs.readFileSync(audioPath);
+      this.cleanTemp(audioPath);
 
-      const audioBuffer = Buffer.concat(chunks);
       return {
         audio: audioBuffer,
         format: 'webmOpus',
