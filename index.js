@@ -477,9 +477,9 @@ async function speakInGuild(guildId, text) {
 
   await enqueuePlayback(guildId, async () => {
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 5000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 20000);
     } catch {
-      console.error(`[tts] connection not ready guild=${guildId}`);
+      console.error(`[tts] connection not ready guild=${guildId} status=${connection?.state?.status || 'unknown'}`);
       return;
     }
 
@@ -598,8 +598,12 @@ async function onVoiceJoin(interaction) {
   }
 
   if (voiceConnections.has(interaction.guild.id)) {
-    await interaction.editReply({ content: 'Already connected' });
-    return;
+    const existing = voiceConnections.get(interaction.guild.id);
+    if (existing?.state?.status === VoiceConnectionStatus.Ready) {
+      await interaction.editReply({ content: 'Already connected' });
+      return;
+    }
+    cleanupGuild(interaction.guild.id);
   }
 
   const connection = joinVoiceChannel({
@@ -723,8 +727,12 @@ client.on('messageCreate', async (message) => {
         return;
       }
       if (voiceConnections.has(message.guild.id)) {
-        await message.reply('Already connected.');
-        return;
+        const existing = voiceConnections.get(message.guild.id);
+        if (existing?.state?.status === VoiceConnectionStatus.Ready) {
+          await message.reply('Already connected.');
+          return;
+        }
+        cleanupGuild(message.guild.id);
       }
 
       const connection = joinVoiceChannel({
@@ -736,11 +744,19 @@ client.on('messageCreate', async (message) => {
       });
 
       voiceConnections.set(message.guild.id, connection);
+      connection.on('stateChange', (oldState, newState) => {
+        if (CONFIG.debugVoice) {
+          console.log(
+            `[voice] text state ${message.guild.id}: ${oldState?.status || 'unknown'} -> ${newState?.status || 'unknown'}`
+          );
+        }
+      });
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 15000);
         console.log(`Voice ready in guild ${message.guild.id} (fallback command)`);
         setupReceiver(message.guild.id, connection);
       } catch (error) {
+        console.error(`[voice] join failed guild=${message.guild.id} status=${connection?.state?.status || 'unknown'} err=${error.message}`);
         cleanupGuild(message.guild.id);
         await message.reply(`Voice connection failed: ${error.message}`);
         return;
