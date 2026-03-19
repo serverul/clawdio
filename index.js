@@ -81,6 +81,7 @@ const CONFIG = {
   language: process.env.LANGUAGE || 'ro',
   minUtteranceMs: Number(process.env.MIN_UTTERANCE_MS || 350),
   maxUtteranceMs: Number(process.env.MAX_UTTERANCE_MS || 12000),
+  debugVoice: String(process.env.DEBUG_VOICE || '1') !== '0',
 };
 
 function validateConfig() {
@@ -344,6 +345,9 @@ function setupReceiver(guildId, connection) {
   if (!receiver) return;
 
   receiver.speaking.on('start', (userId) => {
+    if (CONFIG.debugVoice) {
+      console.log(`[voice] speaking.start guild=${guildId} user=${userId}`);
+    }
     const key = collectorKey(guildId, userId);
     if (collectors.has(key)) return;
 
@@ -385,8 +389,11 @@ function setupReceiver(guildId, connection) {
     decoder.on('end', async () => {
       collectors.delete(key);
       const elapsed = Date.now() - state.startedAt;
+      if (CONFIG.debugVoice) {
+        console.log(`[voice] utterance.end guild=${guildId} user=${userId} elapsedMs=${elapsed} bytes=${state.bytes}`);
+      }
       if (elapsed < CONFIG.minUtteranceMs) return;
-      if (state.bytes < 16000) return;
+      if (state.bytes < 4000) return;
 
       const pcmMono = Buffer.concat(state.chunks);
       await processUtterance(guildId, pcmMono);
@@ -576,6 +583,14 @@ async function onVoiceJoin(interaction) {
 
   voiceConnections.set(interaction.guild.id, connection);
 
+  connection.on('stateChange', (oldState, newState) => {
+    if (CONFIG.debugVoice) {
+      const from = oldState?.status || 'unknown';
+      const to = newState?.status || 'unknown';
+      console.log(`[voice] state ${interaction.guild.id}: ${from} -> ${to}`);
+    }
+  });
+
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
       await Promise.race([
@@ -587,10 +602,15 @@ async function onVoiceJoin(interaction) {
     }
   });
 
-  connection.on(VoiceConnectionStatus.Ready, () => {
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15000);
     console.log(`Voice ready in guild ${interaction.guild.id}`);
     setupReceiver(interaction.guild.id, connection);
-  });
+  } catch (error) {
+    cleanupGuild(interaction.guild.id);
+    await interaction.editReply({ content: `Voice connection failed: ${error.message}` });
+    return;
+  }
 
   await interaction.editReply({ content: `Joined ${voiceChannel.name}` });
 }
@@ -662,6 +682,7 @@ client.on('messageCreate', async (message) => {
 
   const text = (message.content || '').trim().toLowerCase();
   if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status') return;
+  if (text !== '!voice join' && text !== '!voice leave' && text !== '!voice status' && text !== '!voice testtts') return;
 
   console.log(`Text fallback command received: ${text} from ${message.author.tag}`);
 
@@ -712,6 +733,16 @@ client.on('messageCreate', async (message) => {
     if (text === '!voice status') {
       const status = voiceConnections.has(message.guild.id) ? 'connected' : 'idle';
       await message.reply(`Voice: ${status}, Gateway: ${gatewayConnected ? 'connected' : 'disconnected'}, Pending: ${pendingQueue.length}`);
+      return;
+    }
+
+    if (text === '!voice testtts') {
+      if (!voiceConnections.has(message.guild.id)) {
+        await message.reply('Not connected. Use !voice join first.');
+        return;
+      }
+      await speakInGuild(message.guild.id, 'Audio output test successful.');
+      await message.reply('Played TTS test in voice channel.');
     }
   } catch (error) {
     console.error(`Fallback command failed: ${error.message}`);
